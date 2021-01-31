@@ -1,6 +1,6 @@
 #  ExecutorServiceProxy
 
-**executor服务的分布式实现。**
+**executor服务的分布式实现。这一部分的分析有的就加在了代码框内，遇到代码框不要嫌麻烦直接跳过了~**
 
 ```java
 public class ExecutorServiceProxy

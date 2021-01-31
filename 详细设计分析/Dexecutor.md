@@ -93,7 +93,7 @@ hazelcast提供了一种保护方法，可以防止这种裂脑的发生
     }
 ```
 
-分布式执行时，`cancel`方法通过前置知识中的concurrentmap中的remove在集合中取消掉这一个进程的位置；再进行多次判断，需要在确实进程不空+收到了取消例外的标志+数据有效的情况下才真正取消
+分布式执行时，`cancel`方法通过前置知识中的concurrentmap中的remove在集合中取消掉这一个进程的位置；**再进行多次判断**，需要在确实进程不空+收到了取消例外的标志+数据有效的情况下才真正取消
 
 ```java
     public boolean cancel(UUID uuid, boolean interrupt) {
@@ -187,7 +187,7 @@ private final class Processor extends FutureTask implements Runnable {
         private final boolean statisticsEnabled;
 ```
 
-提供了两种构造方法，分别对应runnable和callable类型（代码仅展示一种）
+提供了**两种构造方法 **，分别对应runnable和callable类型（代码仅展示一种）
 
 ```java
 
@@ -205,7 +205,7 @@ private final class Processor extends FutureTask implements Runnable {
         }
 ```
 
-核心函数 run函数中调用监察函数计时，返回给最外部的接口 `executorStats` 同时也处理了例外，具体处理方式见下述代码及注释：
+核心函数 run函数中调用**监察函数计时** ，返回给最外部的接口 `executorStats` 同时也处理了例外，具体处理方式见下述代码及注释：
 
 ```java
         @Override
@@ -238,7 +238,7 @@ private final class Processor extends FutureTask implements Runnable {
         }
 ```
 
-还有三个小的分方法, 内容及实现方式直接在代码框中给出：
+还有三个小的分方法, 涉及到**错误日志和结果的发送** ，内容及实现方式直接在代码框中给出：
 
 ```java
         private void logException(Exception e) {
