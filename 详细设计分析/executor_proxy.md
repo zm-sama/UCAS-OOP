@@ -82,6 +82,171 @@ public class ExecutorServiceProxy
     }
 ```
 
+`invoke`方法：将任务加入对应的队列，包括带时间参数和不带时间参数的两个版本，其中带时间参数的还涉及到了wait函数，分别罗列如下：
+
+```java
+    @Nonnull
+    @Override
+    public <T> List<Future<T>> invokeAll(@Nonnull Collection<? extends Callable<T>> tasks)
+            throws InterruptedException {
+        checkNotNull(tasks, "tasks must not be null");
+        List<Future<T>> futures = new ArrayList<>(tasks.size());//创建序列
+        List<Future<T>> result = new ArrayList<>(tasks.size());//创建序列
+        for (Callable<T> task : tasks) {
+            futures.add(submit(task));
+        }
+        for (Future<T> future : futures) {
+            result.add(completedSynchronously(future, getNodeEngine().getSerializationService()));
+        }//将对应项加入序列
+        return result;
+    }
+```
+
+带时间参数更为复杂：
+
+```java
+@Nonnull
+    @Override
+    public <T> List<Future<T>> invokeAll(@Nonnull Collection<? extends Callable<T>> tasks,
+                                         long timeout,
+                                         @Nonnull TimeUnit unit) {
+        checkNotNull(unit, "unit must not be null");
+        checkNotNull(tasks, "tasks must not be null");
+
+        long timeoutNanos = unit.toNanos(timeout);
+        List<Future<T>> futures = new ArrayList<>(tasks.size());//同样创建序列
+        boolean done = false;
+        try {
+            for (Callable<T> task : tasks) {
+                long startNanos = Timer.nanos();
+                int partitionId = getTaskPartitionId(task);
+                futures.add(submitToPartitionOwner(task, partitionId, true));
+                timeoutNanos -= Timer.nanosElapsed(startNanos);//完成一个任务后，时间片自减
+            }
+            if (timeoutNanos <= 0L) {
+                return futures;//最终超过时间上限，则失败
+            }
+
+            done = wait(timeoutNanos, futures);//需要等待直到时间片结束
+            return futures;
+        } catch (Throwable t) {
+            logger.severe(t);
+            return futures;
+        } finally {
+            if (!done) {
+                cancelAll(futures);//若没有最后的完成标志，则取消剩余的任务
+            }
+        }
+    }
+```
+
+带时间参数的invoke方法中，较为关键的 `wait`函数：
+
+```java
+    private <T> boolean wait(long timeoutNanos, List<Future<T>> futures) throws InterruptedException {
+        boolean done = true;
+        for (int i = 0, size = futures.size(); i < size; i++) {
+            long startNanos = Timer.nanos();
+            Object value;
+            try {
+                Future<T> future = futures.get(i);//get方法拥有"状态依赖"的内在特性，因而调用者不需要知道任务的状态，此外在任务提交和获得结果中包含的安全发布属性也确保了这个方法是线程安全的。Future.get的异常处理代码将处理两个可能的问题：任务遇到一个Exception，时间片耗尽。
+                value = future.get(timeoutNanos, TimeUnit.NANOSECONDS);
+            } catch (ExecutionException e) {
+                value = e;
+            } catch (TimeoutException e) {//时间片耗尽，则返回失败
+                done = false;
+                for (int l = i; l < size; l++) {
+                    Future<T> f = futures.get(i);
+                    if (f.isDone()) {//若部分完成，则将已完成的任务放入future中
+                        futures.set(l, completedSynchronously(f, getNodeEngine().getSerializationService()));
+                    }
+                }
+                break;
+            }
+
+            futures.set(i, InternalCompletableFuture.newCompletedFuture(value));
+            timeoutNanos -= Timer.nanosElapsed(startNanos);
+        }
+        return done;
+    }
+```
+
+`cancel ALL`调用了future中的cancel方法取消所有list中的futuren型任务，较为简单，就不再多提。
+
+`invoke Any`由于任意执行，所以只需要throw出奇怪的例外处理就行，内部就一行
+
+后续还有很多细碎的判断方法，这里略去，基本看一眼就知道他在分析什么。
+
+**值得注意的方法：** shutdown和shutdownNow:
+
+- shutdown：停止，先将任务提交到关闭操作（后续调用方法包中的shutdown方法关闭）,最后用上最开始的关闭例外处理传给waitddl处理，相当于正在执行的任务会继续执行下去，没有被执行的则中断。
+- shutdownNow: 最后额外加了返回一个空表，相当于强行停止所有任务，正在执行的任务也会被直接中断。
+
+```java
+    public void shutdown() {
+        NodeEngine nodeEngine = getNodeEngine();
+        Collection<Member> members = nodeEngine.getClusterService().getMembers();
+        OperationService operationService = nodeEngine.getOperationService();
+        Collection<Future> calls = new LinkedList<>();
+
+        for (Member member : members) {
+            Future f = submitShutdownOperation(operationService, member);
+            calls.add(f);
+        }
+        waitWithDeadline(calls, 3, TimeUnit.SECONDS, shutdownExceptionHandler);// 
+        //Calculate timeouts for whole operation and per future. If corresponding TimeUnits not set assume
+        // the default of TimeUnit.SECONDS
+    }
+
+    private InvocationFuture<Object> submitShutdownOperation(OperationService operationService, Member member) {
+        ShutdownOperation op = new ShutdownOperation(name);
+        return operationService.invokeOnTarget(getServiceName(), op, member.getAddress());
+    }
+/**************************************************************************************************/
+    @Nonnull
+    @Override
+    public List<Runnable> shutdownNow() {
+        shutdown();
+        return Collections.emptyList();
+    }
+
+```
+
+最后是一个选择成员的函数，其中select方法经过笔者四层的深度搜索，发现在 `cluster.MemberSelector.java`方法中给出了一定的注释的select 但是似乎也没什么特殊的选择，可能就是一种随机的选择，重点在于选择的时候进行了附加的判断，而不是选择的方式：
+
+```java
+    private List<Member> selectMembers(@Nonnull MemberSelector memberSelector) {
+        checkNotNull(memberSelector, "memberSelector must not be null");
+        List<Member> selected = new ArrayList<>();
+        Collection<Member> members = getNodeEngine().getClusterService().getMembers();
+        for (Member member : members) {
+            if (memberSelector.select(member)) {//以为很特殊，但实际很正常
+                selected.add(member);
+            }
+        }
+        if (selected.isEmpty()) {
+            throw new RejectedExecutionException("No member selected with memberSelector[" + memberSelector + "]");//错误处理
+        }
+        return selected;
+    }
+```
+
+```java
+public interface MemberSelector {
+
+    /**
+     * Decides if the given member will be part of an operation or not.
+     *
+     * @param member the member instance to decide upon
+     * @return true if the member should take part in the operation, false otherwise
+     */
+    boolean select(Member member);
+
+}
+```
+
+
+
 ### 主要方法：
 
 **根据execute中不同参数决定在怎样的成员上执行任务**
